@@ -1,0 +1,15 @@
+[Unit]
+Description=CNC Mebel — Employee Bot
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=deployer
+WorkingDirectory=/opt/cnc_mebel_bot/server
+EnvironmentFile=/opt/cnc_mebel_bot/.env
+ExecStart=/opt/cnc_mebel_bot/venv/bin/python -m bot.main
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

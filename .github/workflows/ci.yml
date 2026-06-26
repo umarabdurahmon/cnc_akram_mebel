@@ -1,0 +1,127 @@
+name: CI / Deploy
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  # ── 1. Lint + type-check + tests + frontend build ────────────────────────────
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB:       furniture
+          POSTGRES_USER:     furniture
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      BOT_TOKEN:         "0:ci_placeholder_not_a_real_token"
+      DATABASE_URL:      "postgresql+psycopg://furniture:testpass@localhost:5432/furniture"
+      TEST_DATABASE_URL: "postgresql+psycopg://furniture:testpass@localhost:5432/furniture_test"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Python ───────────────────────────────────────────────────────────────
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python deps (dev)
+        run: pip install -e "server/.[dev]"
+
+      - name: Create test database
+        run: psql postgresql://furniture:testpass@localhost:5432/furniture -c "CREATE DATABASE furniture_test;"
+
+      - name: Lint + type-check
+        run: cd server && ruff check . && ruff format --check . && mypy app
+
+      - name: Run tests
+        run: cd server && pytest
+
+      # ── Node / Frontend ──────────────────────────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: cd frontend && npm ci && npm run lint && npm run build
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ── 2. Deploy to DigitalOcean Droplet (master push only) ─────────────────────
+  deploy:
+    name: Deploy
+    needs: ci
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist/
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "${{ secrets.DROPLET_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync frontend to server
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/id_deploy" \
+            frontend-dist/ \
+            ${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_HOST }}:/opt/cnc_mebel_bot/frontend/dist/
+
+      - name: Deploy backend
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:     ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USER }}
+          key:      ${{ secrets.DROPLET_SSH_KEY }}
+          port:     ${{ secrets.DROPLET_PORT || 22 }}
+          script: |
+            set -euo pipefail
+
+            cd /opt/cnc_mebel_bot
+
+            echo "==> git pull"
+            git pull origin master
+
+            echo "==> install/update python deps"
+            /opt/cnc_mebel_bot/venv/bin/pip install -e "server/." -q
+
+            echo "==> run migrations"
+            cd server
+            /opt/cnc_mebel_bot/venv/bin/alembic upgrade head
+            cd ..
+
+            echo "==> restart services"
+            sudo systemctl restart cnc-api cnc-bot cnc-client-bot
+
+            echo "==> done"
